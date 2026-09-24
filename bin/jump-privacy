@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# jump-privacy - WSL front end; acts on the Windows host. on | off | toggle | status | auto on|off
+set -u
+cd /mnt/c || exit 1
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File \
+  'C:\Users\perez\AppData\Local\JumpPrivacy\JumpPrivacy.ps1' "$@" 2>&1 | tr -d '\r'
+exit "${PIPESTATUS[0]}"
