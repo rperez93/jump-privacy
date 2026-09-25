@@ -1,0 +1,37 @@
+MIT License with Commercial Use Restriction
+
+Copyright (c) 2026 Rafael Pérez (https://github.com/rperez93)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+documentation files (the "Software"), to use, copy, modify, merge, publish and distribute the Software, and to
+permit persons to whom the Software is furnished to do so, for Non-Commercial Purposes only, subject to the
+following conditions:
+
+1. Notice. The above copyright notice and this permission notice shall be included in all copies or
+   substantial portions of the Software.
+
+2. Commercial use requires permission. The Software, and any work derived from it, may not be used for
+   Commercial Purposes without prior written permission from the copyright holder. "Commercial Purposes" means
+   any use intended for, or directed toward, commercial advantage or monetary compensation, including but not
+   limited to:
+     (a) selling, renting, licensing or sublicensing the Software or a derivative work;
+     (b) including the Software or a derivative work in a product, service or distribution offered for a fee
+         or supported by advertising;
+     (c) using the Software to provide a service to third parties for a fee; and
+     (d) using the Software in the operations of a for-profit organisation.
+   Personal, educational and non-profit use is a Non-Commercial Purpose. To request permission, open an issue
+   at https://github.com/rperez93/jump-privacy or contact the copyright holder through
+   https://github.com/rperez93. Permission is granted only in writing and on terms set by the copyright holder.
+
+3. Reservation of rights. The copyright holder retains all rights not expressly granted above, including the
+   exclusive right to use, license, sell and otherwise commercialise the Software, alone or with others, on any
+   terms. Nothing in this licence limits the copyright holder's own use of the Software.
+
+4. Termination. Any use in breach of these conditions automatically terminates the permissions granted to the
+   person in breach.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.

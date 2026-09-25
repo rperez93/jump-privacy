@@ -111,3 +111,10 @@ Before trying it, learn the blind recovery in case the desk is left without a pi
 1. **Win+P**, then **↑** to the first entry ("PC screen only"), then **Enter**.
 2. If that does not work, **Win+Ctrl+Shift+B** (graphics driver reset).
 3. If that does not work either, reconnect from the iPad and switch back to Host Displays.
+
+## License
+
+MIT-style licence with a **commercial use restriction** — see [LICENSE](LICENSE). Free for personal,
+educational and non-profit use. Any commercial use (selling it, shipping it in a paid product or service, or using
+it inside a for-profit organisation) needs written permission first: open an issue here or contact
+[@rperez93](https://github.com/rperez93). This is a source-available licence, not an OSI-approved open-source one.
