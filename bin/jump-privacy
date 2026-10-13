@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# jump-privacy - WSL front end; acts on the Windows host. on | off | toggle | status | auto on|off
+# jump-privacy - WSL front end; acts on the Windows host. on | off | toggle | status | auto on|off | restore [0-100]
 set -u
 cd /mnt/c || exit 1
 lad=$(cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r')

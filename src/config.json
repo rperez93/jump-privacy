@@ -1,6 +1,6 @@
 {
   "auto": false,
-  "dim": true,
+  "dim": false,
   "panelBrightness": 0,
   "externalBrightness": 0,
   "hotkey": "Ctrl+Alt+Shift+P",

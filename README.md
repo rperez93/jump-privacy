@@ -16,7 +16,7 @@ Panic hotkey while the curtain is up: **Ctrl+Alt+Shift+P** (typeable from an iPa
 - **Curtain.** One black, topmost, click-through window per *physical* monitor, flagged
   `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`. Windows shows it on the panels and omits it from screen capture,
   so the room sees black while Jump streams the desktop underneath. Input passes straight through.
-- **Hardware dimming** (`dim`). While the curtain is up, brightness drops to `externalBrightness` on the external
+- **Hardware dimming** (`dim`, off by default: the curtain alone is enough). If enabled, while the curtain is up brightness drops to `externalBrightness` on the external
   monitors (DDC/CI VCP 0x10) and `panelBrightness` on the laptop panel (WMI). The desk values are saved to
   `state.json` before anything is dimmed. Every exit restores them, and so does the next `event` or `off` after a
   crash or reboot. A value that fails to restore is kept for the next attempt.
@@ -51,7 +51,7 @@ the log is `privacy.log`, and the curtain is precompiled to `Curtain.<hash>.dll`
 | key | default | meaning |
 |---|---|---|
 | `auto` | `false` | engage on Jump connect / release on disconnect (`jump-privacy auto on\|off`) |
-| `dim` | `true` | hardware brightness to the values below while the curtain is up |
+| `dim` | `false` | hardware brightness to the values below while the curtain is up |
 | `panelBrightness` | `0` | laptop panel, WMI 0–100 |
 | `externalBrightness` | `0` | external monitors, DDC/CI 0–100 |
 | `hotkey` | `Ctrl+Alt+Shift+P` | release hotkey (`Ctrl`/`Alt`/`Shift`/`Win` + a `System.Windows.Forms.Keys` name) |

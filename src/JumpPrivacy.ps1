@@ -2,12 +2,14 @@
 #
 #   jump-privacy on | off | toggle | status
 #   jump-privacy auto on|off     raise the curtain on Jump connect, drop it on disconnect
+#   jump-privacy restore [0-100] put the brightness back by hand: the pending snapshot, else the last desk values,
+#                                or the laptop panel to the given percentage
 #
 # Internal actions: `serve` (the curtain process itself), `event` (run by the JumpPrivacyWatch task on every
 # Application-log entry from provider "Jump Desktop Connect", and at logon) and `compile` (run by Install.ps1).
 #
 # The curtain (Curtain.cs) is an exclude-from-capture black overlay on every physical monitor, so the room sees
-# black and the Jump stream sees the desktop. With config.dim, hardware brightness also drops to its minimum while it
+# black and the Jump stream sees the desktop. With config.dim (off by default), hardware brightness also drops while it
 # is up (DDC/CI on the externals, WMI on the laptop panel). The desk values are written to state.json BEFORE anything
 # is dimmed; every exit path restores them, and a snapshot left behind by a crash or reboot is restored by the next
 # `event` run (the task also fires at logon) or `off`. Entries that fail to restore are kept for the next attempt.
@@ -27,7 +29,7 @@ if ((Test-Path $logFile) -and (Get-Item $logFile).Length -gt 256KB) { Remove-Ite
 
 function Read-Json($f) { if (Test-Path $f) { try { return Get-Content $f -Raw | ConvertFrom-Json } catch {} }; $null }
 # Defaults first, config.json on top: a file missing a key still works, and the key is written back on the next save.
-$cfg = [pscustomobject]@{ auto = $false; dim = $true; panelBrightness = 0; externalBrightness = 0; hotkey = 'Ctrl+Alt+Shift+P'; lockOnDisconnect = $true }
+$cfg = [pscustomobject]@{ auto = $false; dim = $false; panelBrightness = 0; externalBrightness = 0; hotkey = 'Ctrl+Alt+Shift+P'; lockOnDisconnect = $true }
 $fileCfg = Read-Json $cfgFile
 if ($fileCfg) { foreach ($p in $fileCfg.PSObject.Properties) { $cfg | Add-Member -Force $p.Name $p.Value } }
 function Save-Config { $cfg | ConvertTo-Json | Set-Content $cfgFile -Encoding UTF8 }
@@ -96,6 +98,7 @@ function Invoke-Dim {
   if (-not $st.restore) {                                   # keep an older unrestored snapshot: it holds the real desk values
     $ext = @{}; foreach ($kv in ([JumpPrivacy.Ddc]::Get(0x10)).GetEnumerator()) { $ext[$kv.Key] = $kv.Value }
     Set-StateField restore ([pscustomobject]@{ panel = (Get-PanelBrightness); external = [pscustomobject]$ext })
+    Set-StateField desk (Get-State).restore                 # survives the restore, for a manual `restore` later
     $st = Get-State
   }
   $done = @()
@@ -114,6 +117,33 @@ function Invoke-Restore {
   if ($null -ne $r.panel) { if (Set-PanelBrightness ([int]$r.panel)) { $r.panel = $null } else { $failed += 'panel' } }
   if ($failed.Count -eq 0) { Set-StateField restore $null; Log 'restored brightness' }
   else { Set-StateField restore $r; Log ('restore incomplete, kept for retry: {0}' -f ($failed -join ',')) }
+}
+
+# Manual recovery for a restore that reported success but left a screen dark. Sets, waits, reads back.
+function Invoke-ManualRestore([string]$v) {
+  if (Test-Running) { return 'Curtain is up; drop it with: jump-privacy off' }
+  foreach ($k in 'pid', 'since', 'why', 'hotkeyOk') { Set-StateField $k $null }   # left behind by a killed curtain
+  Import-Curtain
+  $st = Get-State
+  if ($v) {
+    if ($v -notmatch '^\d+$' -or [int]$v -gt 100) { return 'Usage: jump-privacy restore [0-100]' }
+    $src = 'requested'; $t = [pscustomobject]@{ panel = [int]$v; external = [pscustomobject]@{} }
+  } elseif ($st.restore) { $src = 'pending snapshot'; $t = $st.restore }
+  elseif ($st.desk) { $src = 'last desk values'; $t = $st.desk }
+  else { return ('No snapshot recorded yet; panel reads {0}. Give a value: jump-privacy restore 70' -f (Get-PanelBrightness)) }
+  $out = @()
+  if ($null -ne $t.panel) {
+    $ok = Set-PanelBrightness ([int]$t.panel); Start-Sleep -Milliseconds 400
+    $now = Get-PanelBrightness
+    if (-not $ok -or $now -ne [int]$t.panel) { [void](Set-PanelBrightness ([int]$t.panel)); Start-Sleep -Milliseconds 400; $now = Get-PanelBrightness }
+    $out += 'panel {0} -> reads {1}' -f $t.panel, $now
+  }
+  foreach ($p in @($t.external.PSObject.Properties)) {
+    $out += '{0} {1} ({2})' -f ($p.Name -replace '^\\\\\.\\', ''), $p.Value, $(if ([JumpPrivacy.Ddc]::Set($p.Name, 0x10, [uint32]$p.Value)) { 'ok' } else { 'FAILED' })
+  }
+  if ($st.restore -and -not $v) { Set-StateField restore $null }
+  Log ('manual restore ({0}): {1}' -f $src, ($out -join '; '))
+  "Restored from $src`: " + ($out -join '; ')
 }
 
 # --- the curtain process ---------------------------------------------------------------------------------------
@@ -206,6 +236,7 @@ switch ($Action.ToLower()) {
   'toggle'  { if (Test-Running) { Invoke-Off 'manual' } else { Invoke-On 'manual' } }
   'serve'   { Start-Serve $(if ($Value) { $Value } else { 'manual' }) }
   'event'   { Invoke-Event }
+  'restore' { Invoke-ManualRestore $Value }
   'selftest' {                                              # session logic against synthetic event sequences
     $t = Get-Date; $n = 0
     function E($sec, $msg) { $script:n++; [pscustomobject]@{ TimeCreated = $t.AddSeconds($sec); RecordId = $script:n; Message = $msg } }
@@ -235,7 +266,8 @@ switch ($Action.ToLower()) {
     'sessions: ' + (@(Get-OpenSessions) -join ', ')
     'dim     : ' + $(if ($cfg.dim) { "on (panel -> $($cfg.panelBrightness), externals -> $($cfg.externalBrightness))" } else { 'off' })
     'hotkey  : ' + $cfg.hotkey + '   lock on disconnect: ' + $cfg.lockOnDisconnect
+    if ($st.desk) { 'desk    : panel ' + $st.desk.panel + '; ' + (Format-Ext $st.desk.external) + '   (jump-privacy restore)' }
     if ($st.restore) { 'pending : brightness snapshot not yet restored (panel ' + $st.restore.panel + '; ' + (Format-Ext $st.restore.external) + ')' }
   }
-  default { 'Usage: jump-privacy on|off|toggle|status|auto on|off' }
+  default { 'Usage: jump-privacy on|off|toggle|status|auto on|off|restore [0-100]' }
 }
