@@ -29,7 +29,7 @@ if ((Test-Path $logFile) -and (Get-Item $logFile).Length -gt 256KB) { Remove-Ite
 
 function Read-Json($f) { if (Test-Path $f) { try { return Get-Content $f -Raw | ConvertFrom-Json } catch {} }; $null }
 # Defaults first, config.json on top: a file missing a key still works, and the key is written back on the next save.
-$cfg = [pscustomobject]@{ auto = $false; dim = $false; panelBrightness = 0; externalBrightness = 0; hotkey = 'Ctrl+Alt+Shift+P'; lockOnDisconnect = $true }
+$cfg = [pscustomobject]@{ auto = $false; dim = $false; panelBrightness = 0; externalBrightness = 0; hotkey = 'Ctrl+Alt+Shift+P'; lockOnDisconnect = $true; lockGraceSeconds = 20 }
 $fileCfg = Read-Json $cfgFile
 if ($fileCfg) { foreach ($p in $fileCfg.PSObject.Properties) { $cfg | Add-Member -Force $p.Name $p.Value } }
 function Save-Config { $cfg | ConvertTo-Json | Set-Content $cfgFile -Encoding UTF8 }
@@ -83,20 +83,26 @@ function Resolve-Sessions($events) {
   }
   @($open.Keys)
 }
-# Same replay -> the time of the last "Connection closed" at or after $after that left no session open, else $null.
-# The lock decision uses this rather than the open count at the moment of checking: after an iPad disconnect the
+# Same replay, for the end of a session. Every stretch with no session open that began at or after $after counts once
+# it has lasted $grace seconds: closed by a later "Authentication Succeeded" no sooner than that, or still running at
+# $now. Shorter stretches are quick reconnects and are tolerated. Returns the start of the first stretch that counts,
+# else $null. A trailing empty stretch that began before $after (or with no close at all) is timed from $after.
+# The decision reads the history rather than the open count at the moment of checking: after an iPad disconnect the
 # display stack can stall every process for ~30 s, and a reconnect inside that stall used to hide the gap (2026-11-12).
-function Find-Gap($events, [datetime]$after) {
-  $open = [ordered]@{}; $gap = $null
+function Find-Gap($events, [datetime]$after, [double]$grace = 0, [datetime]$now = (Get-Date)) {
+  $open = [ordered]@{}; $empty = $after
   foreach ($e in ($events | Sort-Object TimeCreated, RecordId)) {
     $text = $e.Message
     if (-not $text -and $e.Properties -and $e.Properties.Count) { $text = [string]$e.Properties[0].Value }
     if ($text -match '^(Authentication Succeeded|Connection closed): ConnectionID:([^,\s]+)') {
-      if ($Matches[1] -eq 'Authentication Succeeded') { $open[$Matches[2]] = $e.TimeCreated }
-      elseif ($open.Contains($Matches[2])) { $open.Remove($Matches[2]); if (-not $open.Count -and $e.TimeCreated -ge $after) { $gap = $e.TimeCreated } }
+      if ($Matches[1] -eq 'Authentication Succeeded') {
+        if (-not $open.Count -and $e.TimeCreated -gt $after -and ($e.TimeCreated - $empty).TotalSeconds -ge $grace -and $empty -gt $after) { return $empty }
+        $open[$Matches[2]] = $e.TimeCreated
+      } elseif ($open.Contains($Matches[2])) { $open.Remove($Matches[2]); if (-not $open.Count) { $empty = if ($e.TimeCreated -gt $after) { $e.TimeCreated } else { $after } } }
     }
   }
-  $gap
+  if (-not $open.Count -and ($now - $empty).TotalSeconds -ge $grace) { return $empty }
+  $null
 }
 
 # --- hardware brightness ---------------------------------------------------------------------------------------
@@ -190,16 +196,16 @@ function Start-Serve([string]$why) {
       Set-StateField hotkeyOk $ok
       if (-not $ok) { Log "WARNING: hotkey $($cfg.hotkey) could not be registered (taken by another app?)" }
       try { Invoke-Dim } catch { Log "dim failed: $_" } }       # panes are up before the brightness drops
-    # down when no session is open now, or when every session closed at some point since the curtain went up
-    if ($why -eq 'auto') { $hostForm.KeepUp = [Func[bool]] { $ev = Get-JumpEvents; (Resolve-Sessions $ev).Count -gt 0 -and -not (Find-Gap $ev $script:upAt) } }
+    # down once no session has been open for lockGraceSeconds since the curtain went up (now, or at any point since)
+    if ($why -eq 'auto') { $hostForm.KeepUp = [Func[bool]] { -not (Find-Gap (Get-JumpEvents) $script:upAt $cfg.lockGraceSeconds) } }
     $hostForm.BeforeClose = [Action[string]] { param($reason)
       # Lock while the panes still cover the screens, so the room goes from black to the lock screen.
       if ($script:why -ne 'auto' -or $reason -eq 'hotkey') { return }
-      $ev = Get-JumpEvents; $gap = Find-Gap $ev $script:upAt; $n = (Resolve-Sessions $ev).Count
+      $ev = Get-JumpEvents; $gap = Find-Gap $ev $script:upAt $cfg.lockGraceSeconds; $n = (Resolve-Sessions $ev).Count
       $script:gapClose = [bool]$gap -and $n -gt 0                # a new session is already open: raise again after
-      if ($cfg.lockOnDisconnect -and ($gap -or $n -eq 0)) {
+      if ($cfg.lockOnDisconnect -and $gap) {
         [void][JumpPrivacy.Native]::LockWorkStation()
-        Log ('locked workstation' + $(if ($gap) { ' (every session closed at {0:HH:mm:ss}{1})' -f $gap, $(if ($n) { ", $n open again since" } else { '' }) } else { '' }))
+        Log ('locked workstation (no session from {0:HH:mm:ss} for {1} s or more{2})' -f $gap, $cfg.lockGraceSeconds, $(if ($n) { "; $n open again since" } else { '' }))
         Start-Sleep -Milliseconds 1500 } }
     Log "curtain up ($why)"
     [Windows.Forms.Application]::Run($hostForm)
@@ -248,15 +254,14 @@ function Invoke-Event {
   if (-not $running -and (Get-State).restore) { Log 'event: pending brightness snapshot without a curtain -> restore'; Invoke-Restore }
   if (-not $cfg.auto) { return }
   $ev = Get-JumpEvents; $open = Resolve-Sessions $ev; $st = Get-State
-  if ($running -and $st.why -eq 'auto' -and $st.since) {    # a disconnect this run was too late to see as "no sessions"
-    $gap = Find-Gap $ev ([datetime]$st.since)
-    if ($gap) { Log ('event: every session closed at {0:HH:mm:ss} -> off' -f $gap); [void](Invoke-Off 'auto'); $running = Test-Running }
+  # Session over = no session for lockGraceSeconds (Find-Gap). Inside the grace the curtain stays up and its own 5 s
+  # check finishes the job, so a quick reconnect neither locks nor flickers the curtain.
+  if ($running -and $st.why -eq 'auto' -and $st.since) {
+    $gap = Find-Gap $ev ([datetime]$st.since) $cfg.lockGraceSeconds
+    if ($gap) { Log ('event: no session since {0:HH:mm:ss} -> off' -f $gap); [void](Invoke-Off 'auto'); $running = Test-Running }
+    elseif (-not $open.Count) { Log "event: no open sessions; curtain stays up for the $($cfg.lockGraceSeconds) s reconnect grace" }
   }
-  if ($open.Count -gt 0) {
-    if (-not $running) { Log ('event: open sessions {0} -> on' -f ($open -join ',')); Start-Serve 'auto' }
-  } elseif ($running -and (Get-State).why -eq 'auto') {
-    Log 'event: no open sessions -> off'; [void](Invoke-Off 'auto')
-  }
+  if ($open.Count -gt 0 -and -not $running) { Log ('event: open sessions {0} -> on' -f ($open -join ',')); Start-Serve 'auto' }
 }
 
 switch ($Action.ToLower()) {
@@ -278,13 +283,16 @@ switch ($Action.ToLower()) {
       'same timestamp, log order' = @((E 0 ($a -f 'A')), (E 0 ($c -f 'A')));                     # -> none
     }
     foreach ($k in $cases.Keys) { '{0,-26} -> [{1}]' -f $k, ((Resolve-Sessions $cases[$k]) -join ',') }
-    $gaps = [ordered]@{                                     # Find-Gap with the curtain up at +2 s
-      'close, reconnect (race)'   = @((E 0 ($a -f 'A')), (E 10 ($c -f 'A')), (E 40 ($a -f 'B')));   # -> +10
+    $gaps = [ordered]@{                                     # Find-Gap: curtain up at +2 s, grace 20 s, now = +120 s
+      'reconnect after 30 s'      = @((E 0 ($a -f 'A')), (E 10 ($c -f 'A')), (E 40 ($a -f 'B')));   # -> +10
+      'reconnect after 8 s'       = @((E 0 ($a -f 'A')), (E 10 ($c -f 'A')), (E 18 ($a -f 'B')));   # -> none (grace)
+      'closed, nobody back'       = @((E 0 ($a -f 'A')), (E 10 ($c -f 'A')));                         # -> +10
       'overlap, never empty'      = @((E 0 ($a -f 'A')), (E 5 ($a -f 'B')), (E 9 ($c -f 'A')));     # -> none
       'empty before curtain up'   = @((E 0 ($a -f 'A')), (E 1 ($c -f 'A')), (E 3 ($a -f 'B')));     # -> none
       'stray close, no auth'      = @((E 0 ($a -f 'A')), (E 9 ($c -f 'Z')));                         # -> none
     }
-    foreach ($k in $gaps.Keys) { $g = Find-Gap $gaps[$k] $t.AddSeconds(2); 'gap: {0,-24} -> {1}' -f $k, $(if ($g) { '+' + [int]($g - $t).TotalSeconds + ' s' } else { 'none' }) }
+    foreach ($k in $gaps.Keys) { $g = Find-Gap $gaps[$k] $t.AddSeconds(2) 20 $t.AddSeconds(120); 'gap: {0,-24} -> {1}' -f $k, $(if ($g) { '+' + [int]($g - $t).TotalSeconds + ' s' } else { 'none' }) }
+    $g = Find-Gap @((E 0 ($a -f 'A')), (E 110 ($c -f 'A'))) $t.AddSeconds(2) 20 $t.AddSeconds(120); 'gap: closed 10 s ago (grace)  -> ' + $(if ($g) { 'LOCK' } else { 'none yet' })
   }
   'compile' { Import-Curtain; 'compiled: ' + (Get-ChildItem $dir -Filter 'Curtain.*.dll').Name }
   'auto'    {
@@ -301,7 +309,7 @@ switch ($Action.ToLower()) {
     'auto    : ' + $(if ($cfg.auto) { 'on' } else { 'off' }) + ' (task ' + $(if ($t) { "$($t.State), instances $($t.Settings.MultipleInstances), limit $($t.Settings.ExecutionTimeLimit)" } else { 'not installed' }) + ')'
     'sessions: ' + (@(Get-OpenSessions) -join ', ')
     'dim     : ' + $(if ($cfg.dim) { "on (panel -> $($cfg.panelBrightness), externals -> $($cfg.externalBrightness))" } else { 'off' })
-    'hotkey  : ' + $cfg.hotkey + '   lock on disconnect: ' + $cfg.lockOnDisconnect
+    'hotkey  : ' + $cfg.hotkey + '   lock on disconnect: ' + $cfg.lockOnDisconnect + " (after $($cfg.lockGraceSeconds) s with no session)"
     if ($st.desk) { 'desk    : panel ' + $st.desk.panel + '; ' + (Format-Ext $st.desk.external) + '   (jump-privacy restore)' }
     if ($st.restore) { 'pending : brightness snapshot not yet restored (panel ' + $st.restore.panel + '; ' + (Format-Ext $st.restore.external) + ')' }
   }

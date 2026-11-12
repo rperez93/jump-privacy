@@ -4,5 +4,6 @@
   "panelBrightness": 0,
   "externalBrightness": 0,
   "hotkey": "Ctrl+Alt+Shift+P",
-  "lockOnDisconnect": true
+  "lockOnDisconnect": true,
+  "lockGraceSeconds": 20
 }
