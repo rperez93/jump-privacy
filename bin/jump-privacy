@@ -2,6 +2,12 @@
 # jump-privacy - WSL front end; acts on the Windows host. on | off | toggle | status | auto on|off | restore [0-100]
 set -u
 cd /mnt/c || exit 1
-lad=$(cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r')
+# WSL interop can drop a call (vsock accept4 timeout), which used to leave $lad empty and run a bogus path.
+for _ in 1 2 3; do
+  lad=$(cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r')
+  [[ $lad == [A-Za-z]:\\* ]] && break
+  lad=''; sleep 1
+done
+[[ -n $lad ]] || { echo 'jump-privacy: could not read %LOCALAPPDATA% from Windows (WSL interop); try again.' >&2; exit 1; }
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File "$lad\\JumpPrivacy\\JumpPrivacy.ps1" "$@" 2>&1 | tr -d '\r'
 exit "${PIPESTATUS[0]}"
