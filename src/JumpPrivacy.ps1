@@ -59,16 +59,16 @@ function Test-Running {
 # --- Jump sessions, from the Application log --------------------------------------------------------------------
 # Open = authenticated and not yet closed, counting only events since the Jump service last started (a service crash
 # never logs "Connection closed", and a restart ends every session anyway). Falls back to boot time.
-function Get-OpenSessions {
+function Get-JumpEvents {
   $since = $null
   try {
     $svc = Get-CimInstance Win32_Service -Filter "Name='JumpConnect'"
     if ($svc.ProcessId) { $since = (Get-CimInstance Win32_Process -Filter "ProcessId=$($svc.ProcessId)").CreationDate }
   } catch {}
   if (-not $since) { $since = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime }
-  $ev = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Jump Desktop Connect'; StartTime = $since } -ErrorAction SilentlyContinue
-  Resolve-Sessions $ev
+  Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Jump Desktop Connect'; StartTime = $since } -ErrorAction SilentlyContinue
 }
+function Get-OpenSessions { Resolve-Sessions (Get-JumpEvents) }
 # Events (anything with TimeCreated, RecordId, Message or Properties) -> connection IDs authenticated and not yet closed.
 function Resolve-Sessions($events) {
   $open = [ordered]@{}
@@ -82,6 +82,21 @@ function Resolve-Sessions($events) {
     }
   }
   @($open.Keys)
+}
+# Same replay -> the time of the last "Connection closed" at or after $after that left no session open, else $null.
+# The lock decision uses this rather than the open count at the moment of checking: after an iPad disconnect the
+# display stack can stall every process for ~30 s, and a reconnect inside that stall used to hide the gap (2026-11-12).
+function Find-Gap($events, [datetime]$after) {
+  $open = [ordered]@{}; $gap = $null
+  foreach ($e in ($events | Sort-Object TimeCreated, RecordId)) {
+    $text = $e.Message
+    if (-not $text -and $e.Properties -and $e.Properties.Count) { $text = [string]$e.Properties[0].Value }
+    if ($text -match '^(Authentication Succeeded|Connection closed): ConnectionID:([^,\s]+)') {
+      if ($Matches[1] -eq 'Authentication Succeeded') { $open[$Matches[2]] = $e.TimeCreated }
+      elseif ($open.Contains($Matches[2])) { $open.Remove($Matches[2]); if (-not $open.Count -and $e.TimeCreated -ge $after) { $gap = $e.TimeCreated } }
+    }
+  }
+  $gap
 }
 
 # --- hardware brightness ---------------------------------------------------------------------------------------
@@ -163,7 +178,7 @@ function Start-Serve([string]$why) {
   # Stop event and pid first, so an `off` arriving while this process is still starting can reach it.
   $stop = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, $stopName)
   Set-StateField pid $PID; Set-StateField since (Get-Date).ToString('s'); Set-StateField why $why
-  $script:why = $why
+  $script:why = $why; $script:upAt = Get-Date; $script:gapClose = $false
   try {
     Import-Curtain
     if ($why -eq 'auto' -and (Get-OpenSessions).Count -eq 0) { Log 'serve (auto): session already over, not raising'; return }
@@ -175,11 +190,17 @@ function Start-Serve([string]$why) {
       Set-StateField hotkeyOk $ok
       if (-not $ok) { Log "WARNING: hotkey $($cfg.hotkey) could not be registered (taken by another app?)" }
       try { Invoke-Dim } catch { Log "dim failed: $_" } }       # panes are up before the brightness drops
-    if ($why -eq 'auto') { $hostForm.KeepUp = [Func[bool]] { (Get-OpenSessions).Count -gt 0 } }
+    # down when no session is open now, or when every session closed at some point since the curtain went up
+    if ($why -eq 'auto') { $hostForm.KeepUp = [Func[bool]] { $ev = Get-JumpEvents; (Resolve-Sessions $ev).Count -gt 0 -and -not (Find-Gap $ev $script:upAt) } }
     $hostForm.BeforeClose = [Action[string]] { param($reason)
       # Lock while the panes still cover the screens, so the room goes from black to the lock screen.
-      if ($script:why -eq 'auto' -and $cfg.lockOnDisconnect -and $reason -ne 'hotkey' -and (Get-OpenSessions).Count -eq 0) {
-        [void][JumpPrivacy.Native]::LockWorkStation(); Log 'locked workstation'; Start-Sleep -Milliseconds 1500 } }
+      if ($script:why -ne 'auto' -or $reason -eq 'hotkey') { return }
+      $ev = Get-JumpEvents; $gap = Find-Gap $ev $script:upAt; $n = (Resolve-Sessions $ev).Count
+      $script:gapClose = [bool]$gap -and $n -gt 0                # a new session is already open: raise again after
+      if ($cfg.lockOnDisconnect -and ($gap -or $n -eq 0)) {
+        [void][JumpPrivacy.Native]::LockWorkStation()
+        Log ('locked workstation' + $(if ($gap) { ' (every session closed at {0:HH:mm:ss}{1})' -f $gap, $(if ($n) { ", $n open again since" } else { '' }) } else { '' }))
+        Start-Sleep -Milliseconds 1500 } }
     Log "curtain up ($why)"
     [Windows.Forms.Application]::Run($hostForm)
     Log ("curtain down ({0})" -f $hostForm.Reason)
@@ -188,6 +209,10 @@ function Start-Serve([string]$why) {
     try { Invoke-Restore } catch { Log "restore failed: $_" }
     foreach ($k in 'pid', 'since', 'why', 'hotkeyOk') { Set-StateField $k $null }
     $stop.Dispose(); $mutex.ReleaseMutex(); $mutex.Dispose()
+  }
+  if ($script:gapClose -and $cfg.auto) {                    # the reconnect's own event run found this curtain still up
+    Log 'new session already open -> curtain raised again'
+    Start-Process -FilePath "$env:SystemRoot\System32\conhost.exe" -ArgumentList "--headless powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File `"$self`" serve auto" -WindowStyle Hidden
   }
 }
 
@@ -222,7 +247,11 @@ function Invoke-Event {
   $running = Test-Running
   if (-not $running -and (Get-State).restore) { Log 'event: pending brightness snapshot without a curtain -> restore'; Invoke-Restore }
   if (-not $cfg.auto) { return }
-  $open = Get-OpenSessions
+  $ev = Get-JumpEvents; $open = Resolve-Sessions $ev; $st = Get-State
+  if ($running -and $st.why -eq 'auto' -and $st.since) {    # a disconnect this run was too late to see as "no sessions"
+    $gap = Find-Gap $ev ([datetime]$st.since)
+    if ($gap) { Log ('event: every session closed at {0:HH:mm:ss} -> off' -f $gap); [void](Invoke-Off 'auto'); $running = Test-Running }
+  }
   if ($open.Count -gt 0) {
     if (-not $running) { Log ('event: open sessions {0} -> on' -f ($open -join ',')); Start-Serve 'auto' }
   } elseif ($running -and (Get-State).why -eq 'auto') {
@@ -249,6 +278,13 @@ switch ($Action.ToLower()) {
       'same timestamp, log order' = @((E 0 ($a -f 'A')), (E 0 ($c -f 'A')));                     # -> none
     }
     foreach ($k in $cases.Keys) { '{0,-26} -> [{1}]' -f $k, ((Resolve-Sessions $cases[$k]) -join ',') }
+    $gaps = [ordered]@{                                     # Find-Gap with the curtain up at +2 s
+      'close, reconnect (race)'   = @((E 0 ($a -f 'A')), (E 10 ($c -f 'A')), (E 40 ($a -f 'B')));   # -> +10
+      'overlap, never empty'      = @((E 0 ($a -f 'A')), (E 5 ($a -f 'B')), (E 9 ($c -f 'A')));     # -> none
+      'empty before curtain up'   = @((E 0 ($a -f 'A')), (E 1 ($c -f 'A')), (E 3 ($a -f 'B')));     # -> none
+      'stray close, no auth'      = @((E 0 ($a -f 'A')), (E 9 ($c -f 'Z')));                         # -> none
+    }
+    foreach ($k in $gaps.Keys) { $g = Find-Gap $gaps[$k] $t.AddSeconds(2); 'gap: {0,-24} -> {1}' -f $k, $(if ($g) { '+' + [int]($g - $t).TotalSeconds + ' s' } else { 'none' }) }
   }
   'compile' { Import-Curtain; 'compiled: ' + (Get-ChildItem $dir -Filter 'Curtain.*.dll').Name }
   'auto'    {

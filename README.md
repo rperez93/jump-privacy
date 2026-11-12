@@ -33,6 +33,10 @@ Panic hotkey while the curtain is up: **Ctrl+Alt+Shift+P** (typeable from an iPa
 - **Lock on disconnect** (`lockOnDisconnect`). When an auto curtain drops because the last session ended, the
   workstation locks while the panes still cover the screens. The room goes from black to the lock screen, never to
   the desktop. Releasing with the hotkey does not lock.
+  "Last session ended" is read from the event history, not from the moment of checking: if every session closed at
+  any point since the curtain went up, it locks, even when a reconnect arrived before the check could run (after an
+  iPad disconnect the display stack can stall every process for about 30 s). The curtain then rises again for the new
+  session.
 
 ## Install
 
