@@ -22,7 +22,7 @@ $stateFile = Join-Path $dir 'state.json'
 $logFile = Join-Path $dir 'privacy.log'
 $taskName = 'JumpPrivacyWatch'
 $mutexName = 'Local\JumpPrivacyCurtain'
-$stopName = 'Local\JumpPrivacyStop'
+$stopName = 'Local\JumpPrivacyStop'                  # + '-<curtain pid>': each curtain has its own
 
 function Log($m) { Add-Content -Path $logFile -Value ('{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}' -f (Get-Date), $PID, $m) }
 if ((Test-Path $logFile) -and (Get-Item $logFile).Length -gt 256KB) { Remove-Item $logFile }
@@ -182,7 +182,9 @@ function Start-Serve([string]$why) {
   $mutex = New-Object Threading.Mutex($true, $mutexName, [ref]$created)
   if (-not $created) { Log "serve ($why): already running"; $mutex.Dispose(); return }
   # Stop event and pid first, so an `off` arriving while this process is still starting can reach it.
-  $stop = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, $stopName)
+  # Per-curtain name: a stop left signalled for the previous curtain (several event runs per reconnect) used to
+  # close the next one the moment it rose (2026-11-12 12:53:59).
+  $stop = New-Object Threading.EventWaitHandle($false, [Threading.EventResetMode]::ManualReset, "$stopName-$PID")
   Set-StateField pid $PID; Set-StateField since (Get-Date).ToString('s'); Set-StateField why $why
   $script:why = $why; $script:upAt = Get-Date; $script:gapClose = $false
   try {
@@ -232,16 +234,21 @@ function Invoke-On([string]$why) {
   $ok = (Get-State).hotkeyOk
   'Curtain up. Release: jump-privacy off' + $(if ($ok) { ", or $($cfg.hotkey)." } else { ". WARNING: hotkey $($cfg.hotkey) is NOT registered." })
 }
-function Invoke-Off([string]$why) {
-  if (Test-Running) {
+# Stops the curtain named in state.json, or with -Only, only that curtain (an event run passes the one it judged, so a
+# late run never takes down the curtain raised for the next session). Waits for that process, not the mutex.
+function Invoke-Off([string]$why, [int]$Only = 0, [switch]$Lock) {
+  $p = [int](Get-State).pid
+  if ($Only -and $p -ne $Only) { return 'Curtain already replaced.' }
+  if ($p -and (Get-Process -Id $p -ErrorAction SilentlyContinue)) {
     $e = $null
-    if ([Threading.EventWaitHandle]::TryOpenExisting($stopName, [ref]$e)) { [void]$e.Set() }
-    for ($i = 0; $i -lt 40 -and (Test-Running); $i++) { Start-Sleep -Milliseconds 250 }
-    if ($e) { $e.Dispose() }
-    if (Test-Running) {                                     # wedged: kill it, then restore here
-      $p = (Get-State).pid; if ($p) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue; Log "killed wedged curtain $p ($why)" }
+    if ([Threading.EventWaitHandle]::TryOpenExisting("$stopName-$p", [ref]$e)) { [void]$e.Set(); $e.Dispose() }
+    # generous: after an iPad disconnect the curtain's own lock-and-close can take ~30 s (display stall)
+    for ($i = 0; $i -lt 180 -and (Get-Process -Id $p -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 250 }
+    if (Get-Process -Id $p -ErrorAction SilentlyContinue) {  # wedged: kill it, then restore here
+      Stop-Process -Id $p -Force -ErrorAction SilentlyContinue; Log "killed wedged curtain $p ($why)"
+      if ($Lock -and $cfg.lockOnDisconnect) { Import-Curtain; [void][JumpPrivacy.Native]::LockWorkStation(); Log 'locked workstation (for the killed curtain)' }
       Start-Sleep -Milliseconds 500
-      foreach ($k in 'pid', 'since', 'why', 'hotkeyOk') { Set-StateField $k $null }
+      if ([int](Get-State).pid -eq $p) { foreach ($k in 'pid', 'since', 'why', 'hotkeyOk') { Set-StateField $k $null } }
     }
   }
   Invoke-Restore                                            # no-op unless a snapshot is still pending (crash path)
@@ -258,7 +265,7 @@ function Invoke-Event {
   # check finishes the job, so a quick reconnect neither locks nor flickers the curtain.
   if ($running -and $st.why -eq 'auto' -and $st.since) {
     $gap = Find-Gap $ev ([datetime]$st.since) $cfg.lockGraceSeconds
-    if ($gap) { Log ('event: no session since {0:HH:mm:ss} -> off' -f $gap); [void](Invoke-Off 'auto'); $running = Test-Running }
+    if ($gap) { Log ('event: no session since {0:HH:mm:ss} -> off' -f $gap); [void](Invoke-Off 'auto' ([int]$st.pid) -Lock); $running = Test-Running }
     elseif (-not $open.Count) { Log "event: no open sessions; curtain stays up for the $($cfg.lockGraceSeconds) s reconnect grace" }
   }
   if ($open.Count -gt 0 -and -not $running) { Log ('event: open sessions {0} -> on' -f ($open -join ',')); Start-Serve 'auto' }
