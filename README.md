@@ -33,8 +33,9 @@ Panic hotkey while the curtain is up: **Ctrl+Alt+Shift+P** (typeable from an iPa
 - **Lock on disconnect** (`lockOnDisconnect`). When an auto curtain drops because the last session ended, the
   workstation locks while the panes still cover the screens. The room goes from black to the lock screen, never to
   the desktop. Releasing with the hotkey does not lock.
-  "Last session ended" means no session open for `lockGraceSeconds` (20 s). A reconnect inside that grace is
-  tolerated: no lock, and the curtain stays up throughout. The decision is read from the event history, not from the
+  "Last session ended" means no session open for `lockGraceSeconds` (20 s). A reconnect is tolerated when Jump logs
+  its connection request inside that grace and signs it in within `reconnectSetupSeconds` (60 s) of the request, since
+  Jump alone can take 20 s from request to sign-in: no lock, and the curtain stays up throughout. The decision is read from the event history, not from the
   moment of checking, so a gap that lasted the grace locks even when a reconnect arrived before the check could run
   (after an iPad disconnect the display stack can stall every process for about 30 s); the curtain then rises again
   for the new session.
@@ -61,7 +62,8 @@ the log is `privacy.log`, and the curtain is precompiled to `Curtain.<hash>.dll`
 | `externalBrightness` | `0` | external monitors, DDC/CI 0–100 |
 | `hotkey` | `Ctrl+Alt+Shift+P` | release hotkey (`Ctrl`/`Alt`/`Shift`/`Win` + a `System.Windows.Forms.Keys` name) |
 | `lockOnDisconnect` | `true` | lock the workstation when an auto curtain drops at session end |
-| `lockGraceSeconds` | `20` | seconds with no session before that counts as the end; quicker reconnects do not lock |
+| `lockGraceSeconds` | `20` | seconds with no session and no reconnect request before that counts as the end |
+| `reconnectSetupSeconds` | `60` | how long a reconnect requested inside the grace may take to sign in |
 
 ## Verified on the host (GU604VI, Windows 11 25H2, Jump Connect 10.15.28), 2026-09-24
 

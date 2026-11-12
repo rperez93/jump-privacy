@@ -5,5 +5,6 @@
   "externalBrightness": 0,
   "hotkey": "Ctrl+Alt+Shift+P",
   "lockOnDisconnect": true,
-  "lockGraceSeconds": 20
+  "lockGraceSeconds": 20,
+  "reconnectSetupSeconds": 60
 }

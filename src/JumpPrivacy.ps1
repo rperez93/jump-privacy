@@ -29,7 +29,7 @@ if ((Test-Path $logFile) -and (Get-Item $logFile).Length -gt 256KB) { Remove-Ite
 
 function Read-Json($f) { if (Test-Path $f) { try { return Get-Content $f -Raw | ConvertFrom-Json } catch {} }; $null }
 # Defaults first, config.json on top: a file missing a key still works, and the key is written back on the next save.
-$cfg = [pscustomobject]@{ auto = $false; dim = $false; panelBrightness = 0; externalBrightness = 0; hotkey = 'Ctrl+Alt+Shift+P'; lockOnDisconnect = $true; lockGraceSeconds = 20 }
+$cfg = [pscustomobject]@{ auto = $false; dim = $false; panelBrightness = 0; externalBrightness = 0; hotkey = 'Ctrl+Alt+Shift+P'; lockOnDisconnect = $true; lockGraceSeconds = 20; reconnectSetupSeconds = 60 }
 $fileCfg = Read-Json $cfgFile
 if ($fileCfg) { foreach ($p in $fileCfg.PSObject.Properties) { $cfg | Add-Member -Force $p.Name $p.Value } }
 function Save-Config { $cfg | ConvertTo-Json | Set-Content $cfgFile -Encoding UTF8 }
@@ -83,26 +83,35 @@ function Resolve-Sessions($events) {
   }
   @($open.Keys)
 }
-# Same replay, for the end of a session. Every stretch with no session open that began at or after $after counts once
-# it has lasted $grace seconds: closed by a later "Authentication Succeeded" no sooner than that, or still running at
-# $now. Shorter stretches are quick reconnects and are tolerated. Returns the start of the first stretch that counts,
-# else $null. A trailing empty stretch that began before $after (or with no close at all) is timed from $after.
+# Same replay, for the end of a session. A stretch with no session open that began at or after $after counts (returns
+# its start) unless it is a quick reconnect: an "Incomming Connection Request" within $grace seconds of the close,
+# authenticated within $setup seconds of that request (Jump alone can take 20 s from request to sign-in: 2026-11-12
+# 13:19, closed 13:19:21, request :23, auth :43). With no such request a stretch counts once it has lasted $grace, so
+# walking away still locks at $grace. While a request is in progress the end is not decided yet ($null). A trailing
+# empty stretch that began before $after (or with no close at all) is timed from $after.
 # The decision reads the history rather than the open count at the moment of checking: after an iPad disconnect the
 # display stack can stall every process for ~30 s, and a reconnect inside that stall used to hide the gap (2026-11-12).
-function Find-Gap($events, [datetime]$after, [double]$grace = 0, [datetime]$now = (Get-Date)) {
-  $open = [ordered]@{}; $empty = $after
+function Find-Gap($events, [datetime]$after, [double]$grace = 0, [datetime]$now = (Get-Date), [double]$setup = 60) {
+  $open = [ordered]@{}; $empty = $after; $req = @{}
   foreach ($e in ($events | Sort-Object TimeCreated, RecordId)) {
     $text = $e.Message
     if (-not $text -and $e.Properties -and $e.Properties.Count) { $text = [string]$e.Properties[0].Value }
-    if ($text -match '^(Authentication Succeeded|Connection closed): ConnectionID:([^,\s]+)') {
+    if ($text -match '^Incomm?ing Connection Request:.*ConnectionID:([^,\s]+)') {
+      if (-not $open.Count -and ($e.TimeCreated - $empty).TotalSeconds -lt $grace) { $req[$Matches[1]] = $e.TimeCreated }
+    } elseif ($text -match '^(Authentication Succeeded|Connection closed): ConnectionID:([^,\s]+)') {
+      $id = $Matches[2]
       if ($Matches[1] -eq 'Authentication Succeeded') {
-        if (-not $open.Count -and $e.TimeCreated -gt $after -and ($e.TimeCreated - $empty).TotalSeconds -ge $grace -and $empty -gt $after) { return $empty }
-        $open[$Matches[2]] = $e.TimeCreated
-      } elseif ($open.Contains($Matches[2])) { $open.Remove($Matches[2]); if (-not $open.Count) { $empty = if ($e.TimeCreated -gt $after) { $e.TimeCreated } else { $after } } }
+        if (-not $open.Count -and $e.TimeCreated -gt $after -and $empty -gt $after) {
+          $quick = ($e.TimeCreated - $empty).TotalSeconds -lt $grace -or ($req.ContainsKey($id) -and ($e.TimeCreated - $req[$id]).TotalSeconds -le $setup)
+          if (-not $quick) { return $empty }
+        }
+        $open[$id] = $e.TimeCreated; $req = @{}
+      } elseif ($open.Contains($id)) { $open.Remove($id); if (-not $open.Count) { $empty = if ($e.TimeCreated -gt $after) { $e.TimeCreated } else { $after }; $req = @{} } }
     }
   }
-  if (-not $open.Count -and ($now - $empty).TotalSeconds -ge $grace) { return $empty }
-  $null
+  if ($open.Count -or ($now - $empty).TotalSeconds -lt $grace) { return $null }
+  if (@($req.Values | Where-Object { ($now - $_).TotalSeconds -le $setup }).Count) { return $null }   # reconnect in progress
+  $empty
 }
 
 # --- hardware brightness ---------------------------------------------------------------------------------------
@@ -199,11 +208,11 @@ function Start-Serve([string]$why) {
       if (-not $ok) { Log "WARNING: hotkey $($cfg.hotkey) could not be registered (taken by another app?)" }
       try { Invoke-Dim } catch { Log "dim failed: $_" } }       # panes are up before the brightness drops
     # down once no session has been open for lockGraceSeconds since the curtain went up (now, or at any point since)
-    if ($why -eq 'auto') { $hostForm.KeepUp = [Func[bool]] { -not (Find-Gap (Get-JumpEvents) $script:upAt $cfg.lockGraceSeconds) } }
+    if ($why -eq 'auto') { $hostForm.KeepUp = [Func[bool]] { -not (Find-Gap (Get-JumpEvents) $script:upAt $cfg.lockGraceSeconds (Get-Date) $cfg.reconnectSetupSeconds) } }
     $hostForm.BeforeClose = [Action[string]] { param($reason)
       # Lock while the panes still cover the screens, so the room goes from black to the lock screen.
       if ($script:why -ne 'auto' -or $reason -eq 'hotkey') { return }
-      $ev = Get-JumpEvents; $gap = Find-Gap $ev $script:upAt $cfg.lockGraceSeconds; $n = (Resolve-Sessions $ev).Count
+      $ev = Get-JumpEvents; $gap = Find-Gap $ev $script:upAt $cfg.lockGraceSeconds (Get-Date) $cfg.reconnectSetupSeconds; $n = (Resolve-Sessions $ev).Count
       $script:gapClose = [bool]$gap -and $n -gt 0                # a new session is already open: raise again after
       if ($cfg.lockOnDisconnect -and $gap) {
         [void][JumpPrivacy.Native]::LockWorkStation()
@@ -264,9 +273,9 @@ function Invoke-Event {
   # Session over = no session for lockGraceSeconds (Find-Gap). Inside the grace the curtain stays up and its own 5 s
   # check finishes the job, so a quick reconnect neither locks nor flickers the curtain.
   if ($running -and $st.why -eq 'auto' -and $st.since) {
-    $gap = Find-Gap $ev ([datetime]$st.since) $cfg.lockGraceSeconds
+    $gap = Find-Gap $ev ([datetime]$st.since) $cfg.lockGraceSeconds (Get-Date) $cfg.reconnectSetupSeconds
     if ($gap) { Log ('event: no session since {0:HH:mm:ss} -> off' -f $gap); [void](Invoke-Off 'auto' ([int]$st.pid) -Lock); $running = Test-Running }
-    elseif (-not $open.Count) { Log "event: no open sessions; curtain stays up for the $($cfg.lockGraceSeconds) s reconnect grace" }
+    elseif (-not $open.Count) { Log "event: no open sessions; curtain stays up (reconnect grace $($cfg.lockGraceSeconds) s, setup $($cfg.reconnectSetupSeconds) s)" }
   }
   if ($open.Count -gt 0 -and -not $running) { Log ('event: open sessions {0} -> on' -f ($open -join ',')); Start-Serve 'auto' }
 }
@@ -290,7 +299,12 @@ switch ($Action.ToLower()) {
       'same timestamp, log order' = @((E 0 ($a -f 'A')), (E 0 ($c -f 'A')));                     # -> none
     }
     foreach ($k in $cases.Keys) { '{0,-26} -> [{1}]' -f $k, ((Resolve-Sessions $cases[$k]) -join ',') }
-    $gaps = [ordered]@{                                     # Find-Gap: curtain up at +2 s, grace 20 s, now = +120 s
+    $q = 'Incomming Connection Request: Type:Cloud, ConnectionID:{0}, PeerID:X'
+    $gaps = [ordered]@{                                     # Find-Gap: curtain up at +2 s, grace 20 s, setup 60 s, now = +120 s
+      'request +2 s, auth +22 s'  = @((E 0 ($a -f 'A')), (E 10 ($c -f 'A')), (E 12 ($q -f 'B')), (E 32 ($a -f 'B')));   # -> none
+      'request +2 s, auth +80 s'  = @((E 0 ($a -f 'A')), (E 10 ($c -f 'A')), (E 12 ($q -f 'B')), (E 92 ($a -f 'B')));   # -> +10
+      'request +27 s, auth +31 s' = @((E 0 ($a -f 'A')), (E 10 ($c -f 'A')), (E 37 ($q -f 'B')), (E 41 ($a -f 'B')));   # -> +10
+      'request +2 s, never auth'  = @((E 0 ($a -f 'A')), (E 10 ($c -f 'A')), (E 12 ($q -f 'B')));                       # -> +10
       'reconnect after 30 s'      = @((E 0 ($a -f 'A')), (E 10 ($c -f 'A')), (E 40 ($a -f 'B')));   # -> +10
       'reconnect after 8 s'       = @((E 0 ($a -f 'A')), (E 10 ($c -f 'A')), (E 18 ($a -f 'B')));   # -> none (grace)
       'closed, nobody back'       = @((E 0 ($a -f 'A')), (E 10 ($c -f 'A')));                         # -> +10
@@ -300,6 +314,7 @@ switch ($Action.ToLower()) {
     }
     foreach ($k in $gaps.Keys) { $g = Find-Gap $gaps[$k] $t.AddSeconds(2) 20 $t.AddSeconds(120); 'gap: {0,-24} -> {1}' -f $k, $(if ($g) { '+' + [int]($g - $t).TotalSeconds + ' s' } else { 'none' }) }
     $g = Find-Gap @((E 0 ($a -f 'A')), (E 110 ($c -f 'A'))) $t.AddSeconds(2) 20 $t.AddSeconds(120); 'gap: closed 10 s ago (grace)  -> ' + $(if ($g) { 'LOCK' } else { 'none yet' })
+    $g = Find-Gap @((E 0 ($a -f 'A')), (E 80 ($c -f 'A')), (E 85 ($q -f 'B'))) $t.AddSeconds(2) 20 $t.AddSeconds(120); 'gap: request 35 s ago, no auth -> ' + $(if ($g) { 'LOCK' } else { 'none yet (setup)' })
   }
   'compile' { Import-Curtain; 'compiled: ' + (Get-ChildItem $dir -Filter 'Curtain.*.dll').Name }
   'auto'    {
@@ -316,7 +331,7 @@ switch ($Action.ToLower()) {
     'auto    : ' + $(if ($cfg.auto) { 'on' } else { 'off' }) + ' (task ' + $(if ($t) { "$($t.State), instances $($t.Settings.MultipleInstances), limit $($t.Settings.ExecutionTimeLimit)" } else { 'not installed' }) + ')'
     'sessions: ' + (@(Get-OpenSessions) -join ', ')
     'dim     : ' + $(if ($cfg.dim) { "on (panel -> $($cfg.panelBrightness), externals -> $($cfg.externalBrightness))" } else { 'off' })
-    'hotkey  : ' + $cfg.hotkey + '   lock on disconnect: ' + $cfg.lockOnDisconnect + " (after $($cfg.lockGraceSeconds) s with no session)"
+    'hotkey  : ' + $cfg.hotkey + '   lock on disconnect: ' + $cfg.lockOnDisconnect + " (after $($cfg.lockGraceSeconds) s with no session; a reconnect requested sooner gets $($cfg.reconnectSetupSeconds) s to sign in)"
     if ($st.desk) { 'desk    : panel ' + $st.desk.panel + '; ' + (Format-Ext $st.desk.external) + '   (jump-privacy restore)' }
     if ($st.restore) { 'pending : brightness snapshot not yet restored (panel ' + $st.restore.panel + '; ' + (Format-Ext $st.restore.external) + ')' }
   }
